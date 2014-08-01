@@ -30,34 +30,44 @@ import types
 import struct
 from numpy import *
 
+from usb.core import USBError
+
 from .. import ivi
 from .. import fgen
+from .. import simple
+from .. import rfsiggen
 
 StandardWaveformMapping = {
         'sine': 'sin',
         'square': 'squ',
-        'triangle': 'tri',
         'ramp': 'ramp',
         'triangle': 'ramp',
-        'pulse': 'pulse',
-        'noise': 'noise',
+        'pulse': 'puls',
+        'noise': 'nois',
         'dc': 'dc',
+        'arb': 'user',
         'user': 'user'
         }
 
-class rigolDG1022(ivi.Driver, fgen.Base, fgen.StdFunc, fgen.ArbWfm,
-                fgen.ArbSeq, fgen.SoftwareTrigger, fgen.Burst,
-                fgen.ArbChannelWfm):
-    "Rigol DG1022 series arbitrary waveform generator driver"
+class rigolDG1022(ivi.Driver, simple.CommandDrivenDevice, 
+                  fgen.Base, fgen.StdFunc, fgen.ArbWfm, fgen.Burst):
+                  
+    """
+        Rigol DG1022-series arbitrary waveform generator driver
+
+        TODO:
+            -Implement StartTrigger
+            -Implement StopTrigger
+            -Implement AwfmBinary
+    """
     
     def __init__(self, *args, **kwargs):
         self.__dict__.setdefault('_instrument_id', '')
 
-        #Test: implement the waveform amplitude method directly.
-        self._implement_scpi_methods('_output_standard_waveform_amplitude', "VOLT?", "VOLT", lambda x : float(x), lambda x : str(x), True)
-        
+
+        self._define_SCPI_commands()
         super(rigolDG1022, self).__init__(*args, **kwargs)
-        
+
         self._output_count = 2
        
         #TODO: Update me!
@@ -88,11 +98,189 @@ class rigolDG1022(ivi.Driver, fgen.Base, fgen.StdFunc, fgen.ArbWfm,
         self._identity_specification_minor_version = 0
         self._identity_supported_instrument_models = ['DG1022', 'DG1022U', 'DG1022A']
 
+        #Pull in the list of available Standard Waveforms.
+        self._output_standard_waveform_mapping = StandardWaveformMapping
+
+        #On some systems, the DG1022 won't reliably communicate. In these cases, a hackish
+        #solution may be to repeatedly retry until the communcation goes through. Ugly, but effecitve.
+        self.automatic_retry_count = 1 
+
         
         self._init_outputs()
 
+    
+    #
+    # "Quirk" necessary as some Rigol devices don't properly comply with the USB(TMC) spec,
+    # and thus sometimes must be queried more than once. If "automatic_retry_count" is set, the
+    # device will automatically be retriedup to that many times.
+    #
+    def _ask(self, command):
+
+        last_error = None
+
+        #Retry up to N times...
+        for _ in range(self.automatic_retry_count):
+            try:
+                return super(rigolDG1022, self)._ask(command)
+            except USBError as error:
+                last_error = error
+
+        #If we weren't able to succeed in the N tries, raise the last error.
+        raise last_error
+
+
+
+    def _define_SCPI_commands(self):
+        self._define_function_generator_commands()
+        self._define_standard_wafeform_commands()
+        self._define_burst_commands()
+
+        self._add_custom_commands()
+
+
+    def _define_function_generator_commands(self):
+
+        #ivi.add_property(self, 'outputs[].name', self._get_output_name,
+        #ivi.add_property(self, 'outputs[].operation_mode', self._get_output_operation_mode, self._set_output_operation_mode,
+        #ivi.add_property(self, 'outputs[].output_mode',
+
+        self._implement_simple_scpi_methods('_output_enabled', 'OUTP', self._parse_on_off, self._format_on_off, True)
+        self._implement_simple_scpi_methods('_output_impedance', 'OUTP:LOAD', float, str, True)
+        self._implement_scpi_methods('_output_reference_clock_source', None, 'SYST:CLKSRC', float, str, True)
+
+    def _define_standard_wafeform_commands(self):
+        self._implement_simple_scpi_methods('_output_standard_waveform_amplitude', "VOLT", float, str, True)
+        self._implement_simple_scpi_methods('_output_standard_waveform_dc_offset', "VOLT:OFFS", float, str, True)
+        self._implement_simple_scpi_methods('_output_standard_waveform_start_phase', "PHASE", float, str, True)
+        self._implement_simple_scpi_methods('_output_standard_waveform_frequency', "FREQ", float, str, True)
+        self._implement_simple_scpi_methods('_output_standard_waveform_waveform', "FUNC", self._parse_waveform_name, self._format_waveform_name, True)
+
+        #These intermediary methods are called by delegators, which handle the appropriate actions based
+        #on which function we're generating.
+        self._implement_simple_scpi_methods('_output_standard_waveform_duty_cycle_square', "FUNC:SQU:DCYC", float, str, True) 
+        self._implement_simple_scpi_methods('_output_standard_waveform_duty_cycle_pulse',  "PULS:DCYC", float, str, True)  
+
+
+    def _get_output_standard_waveform_duty_cycle_high(self, index):
+        """ 
+            Delegator function which calls the appropriate getter for the duty cycle,
+            given the active waveform.
+        """
+
+        #If we're currnetly producing a square wave, get the square wave's duty cycle. 
+        if self.outputs[index].standard_waveform.waveform == 'square':
+            return self._get_output_standard_waveform_duty_cycle_square(index)
+
+        #... otherwise, return the pulse's duty cycle.
+        else:
+            return self._get_output_standard_waveform_duty_cycle_pulse(index)
 
     
+    def _set_output_standard_waveform_duty_cycle_high(self, index, value):
+        """ 
+            Delegator function which calls the appropriate setter for the duty cycle,
+            given the active waveform.
+        """
+
+        #If we're currnetly producing a square wave, get the square wave's duty cycle. 
+        if self.outputs[index].standard_waveform.waveform == 'square':
+            return self._set_output_standard_waveform_duty_cycle_square(index, value)
+
+        #... otherwise, return the pulse's duty cycle.
+        else:
+            return self._set_output_standard_waveform_duty_cycle_pulse(index, value)
+
+
+
+    def _add_custom_commands(self):
+        """
+            Add commands supported by the DG1022 which aren't supported by our base classes.
+        """
+        self._add_simple_scpi_property('outputs[].standard_waveform.symmetry', 'FUNC:RAMP:SYMM', float, str)
+
+        #Pulse commands:
+        self._add_simple_scpi_property('outputs[].pulse.period', 'PULS:PER', float, str)
+        self._add_simple_scpi_property('outputs[].pulse.width', 'PULS:WID', float, str)
+        self._add_simple_scpi_property('outputs[].pulse.duty_cycle_high', 'PULS:DCYC', float, str)
+
+
+    def _define_burst_commands(self):
+        self._implement_simple_scpi_methods('_output_burst_count', "BURS:NCYC", float, str, True)
+
+
+    @staticmethod
+    def _parse_on_off(value):
+        """ Parses a query which should return ON or OFF as a boolean expression. """
+        return value.lower() != "off"
+
+    @staticmethod
+    def _format_on_off(value):
+        """ Converts a boolean into an ON/OFF for a SCPI request. """
+        return "ON" if value else "OFF"
+
+
+    def _parse_waveform_name(self,value):
+        """ Converts a function-generator encoded wafeform name to a python-ivi human readable standard. """
+
+        #Attmempt to look up the given waveform name in the relevant dictionary.
+        for long_form, short_form in self._output_standard_waveform_mapping.items():
+            if short_form.lower() == value.lower():
+                return value
+
+        #If it doesn't exist, return the function-generator name directly,
+        return value
+
+
+    def _format_waveform_name(self, value):
+        """ Converts a human-readable name to a function-generator comprehensible name. """
+
+        #If this is a known human readable value, convert it to the function generator "short form".
+        if value in self._output_standard_waveform_mapping:
+            return self._output_standard_waveform_mapping[value]
+
+        #Otherwise, return the waveform value unmodified.
+        return value
+
+
+
+    def _get_command_modified_for_channel(self, command, index):
+        """ Modifies the given command to take place on the provided channel index, in Rigol format. """
+
+        #If this is the first channel
+        if index <= 0:
+            return command
+
+        #Compute the channel number, which is one greater than the index.
+        channel_number = index + 1
+
+        #If this is a query, we'll need to add the channel name before the question mark...
+        if "?" in command:
+            command = command.replace("?", ":CH" + str(channel_number) + "?", 1)
+
+        #... otherwise, we can just append it.
+        else:
+            command = command + ":CH" + str(channel_number)
+
+        #Return the modified command.
+        return command
+
+
+    def _adjust_response_for_channel(self, response, index):
+        """
+            Adjusts command responses to remove the channel number, where applicable.
+            The DG1022 responds to the second-channel (and etc.)
+        """
+
+        channel_number = index + 1
+
+        #If this is a channel-prefixed response, remove the channel number.
+        if response.startswith('CH' + str(channel_number) + ':'):
+            response = response[4:]
+
+        #... and return the response otherwise unmodified.
+        return response
+
+
     def initialize(self, resource = None, id_query = False, reset = False, **keywargs):
         "Opens an I/O session to the instrument."
         
@@ -115,166 +303,6 @@ class rigolDG1022(ivi.Driver, fgen.Base, fgen.StdFunc, fgen.ArbWfm,
             self.utility_reset()
 
 
-    def _add_scpi_property(self, property_name, get_command, set_command, response_parser, request_formatter, documentation=None):
-        """ 
-            Adds a new property to the given IVI device by providing the SCPI commands used to get and set that property. Can greatly simplify
-            constructing new SCPI devices.
-
-            property_name:      The name of the property to be added, in the same format accepted by ivi.add_property.
-            get_command:        The SCPI command used to read the property, as a string. (e.g. "VOLT?").
-            set_command:        The SCPI command used to write the property, as a string. (e.g. "VOLT").
-            response_parser:    A function which will be called on the result before it is returned. Intended to be used
-                                to parse the respone from the device into a more pythonic form.
-            request_formatter:  A function which will be called on the user value before it is transmitted to the device. 
-                                Intended to be used to correctly format the given argument for transmission.
-            documentation:      A documentation string to be added to the property, for use with python's built-in help.
-        
-        """
-        
-        #Determine if the given property is an indexed property, from its name.
-        is_indexed = self._property_is_indexed(property_name)
-
-        #Get the relevant functions to handle the SCPI property... 
-        getter, setter = self._generate_scpi_methods(property_name, get_command, set_command, response_parser, request_formatter, is_indexed)
-
-        #... and add the property to the current object.
-        ivi.add_property(self, property_name, getter, setter, None, documentation)
-
-
-
-    def _implement_scpi_methods(self, method_suffix, get_command, set_command, response_parser, request_formatter, indexed = False):
-        """
-            Creates a getter and setter function for a previously-implemented pair of IVI properties. This is typically used to implement a getter/setter
-            pair inherited from a parent IVI class.
-
-            property_name:      The name of the property to be added, in the same format accepted by ivi.add_property.
-            get_command:        The SCPI command used to read the property, as a string. (e.g. "VOLT?").
-            set_command:        The SCPI command used to write the property, as a string. (e.g. "VOLT").
-            response_parser:    A function which will be called on the result before it is returned. Intended to be used
-                                to parse the respone from the device into a more pythonic form.
-            request_formatter:  A function which will be called on the user value before it is transmitted to the device. 
-                                Intended to be used to correctly format the given argument for transmission.
-            indexed:            True iff the previously-implemented IVI properties are indexed.
-        """
-
-        #Get the relevant functions to handle the SCPI property... 
-        getter, setter = self._generate_scpi_methods(method_suffix, get_command, set_command, response_parser, request_formatter, indexed)
-
-        #Bind the two relevant functions to the current object...
-        getter = types.MethodType(getter, self)
-        setter = types.MethodType(setter, self)
-
-        #... and attach them to the expected place in the current module. 
-        setattr(self, "_get" + method_suffix, getter)
-        setattr(self, "_set" + method_suffix, setter)
-
-
-    def _generate_scpi_methods(self, property_name, get_command, set_command, response_parser, request_formatter, indexed = False):
-        """ 
-            Generates a pair of SCPI-command dirven control methods which can be used to get/set simple controls
-            on the relevant device.
-        """
-
-        #Define an inner function whcih will handle assignment to the property.
-        def set_indexed_property(self, index, value):
-
-            if index != -1:
-            
-                #Determine the relevant array index for channel index given....
-                index = ivi.get_index(self._output_name, index)
-
-                #... and adjust the command to contain the channel number, if necessary.
-                command = self._get_command_modified_for_channel(set_command, index)
-
-            #Convert the specified value into correctly formatted request.
-            request = request_formatter(value)
-
-            #If we're not performing a simulation, perform the command itself.
-            if not self._driver_operation_simulate:
-                self._write(command + " " + request)
-
-            #... and update the cache accordingly.
-            getattr(self, property_name)[index] = value
-            self._set_cache_valid(tag=property_name, index=index)
-
-
-        def set_simple_property(self, value):
-            set_indexed_property(self, -1, value)
-
-
-        #Define an inner function which handles the property's read.
-        def get_indexed_property(self, index):
-            nonlocal get_command, response_parser
-
-            if index != -1:
-
-                #Determine the relevant array index for channel index given.
-                index = ivi.get_index(self._output_name, index)
-
-                #adjust the command to contain the channel number, if necessary.
-                command = self._get_command_modified_for_channel(get_command, index)
-
-            #If we're not simulating the device, and nothing has changed, run the relevant command.
-            if not self._driver_operation_simulate and not self._get_cache_valid(tag=property_name, index=index):
-
-                #Perform the raw query...
-                print(command)
-                response = self._ask(command)
-                response = response_parser(response)
-               
-                #... and update the cache.
-                self._set_cached_property(property_name, response, index)
-
-            #Return the relevant cached property.
-            return self._get_cached_property(property_name, index)
-
-        def get_simple_property(self):
-            get_indexed_property(self, -1, value)
-
-
-        #If we have an indexed proeprty, return the indexed pair of methods...
-        if indexed:
-            return (get_indexed_property, set_indexed_property)
-
-        #... otherwise, return the simple ones.
-        else:
-            return (get_simple_property, set_simple_property)
-
-        
-           
-
-    def _set_cached_property(self, property_name, value, index=-1):
-        """ Sets an internally cached property. """
-
-        #If we have an indexed property, get the core property object,
-        #and set the appropriate index.
-        if index != -1:
-            getattr(self, property_name)[index] = value
-            self._set_cache_valid(tag=property_name, index=index)
-
-        #Otherwise, set the parameter itself.
-        else:
-            setattr(self, property_name, value)
-            self._set_cache_valid(tag=property_name)
-
-
-    def _get_cached_property(self, property_name, index=-1):
-        """ Gets the internally cached value of a given property. """
-
-        #Get the value of the property itself...
-        result = getattr(self, property_name)
-
-        #... and, if we have an indexed property, resolve the index.
-        if index != -1:
-            result = result[index]
-
-        return result
-
-    def _property_is_indexed(self, property_name):
-        """ Returns true iff the given property name corresponds to an indexed property. """
-        return property_name.find('[') > 0
-
-
     @classmethod
     def first_connected_device(cls):
         """Convenience method which returns the first connected DG1022."""
@@ -295,12 +323,10 @@ class rigolDG1022(ivi.Driver, fgen.Base, fgen.StdFunc, fgen.ArbWfm,
             self._set_cache_valid(True, 'identity_instrument_model')
             self._set_cache_valid(True, 'identity_instrument_firmware_revision')
 
-
-
     def _reload_id_string_if_necessary(self):
         """ Reloads the device's identification, if it's out of date. """
 
-        if not self.get_cache_valid():
+        if not self._get_cache_valid():
             self._load_id_string()
 
     def _get_identity_instrument_manufacturer(self):
@@ -349,15 +375,16 @@ class rigolDG1022(ivi.Driver, fgen.Base, fgen.StdFunc, fgen.ArbWfm,
     def _utility_unlock_object(self):
         pass
     
-    def _init_outputs(self):
-        try:
-            super(rigolDG1022, self)._init_outputs()
-        except AttributeError:
-            pass
-        
-        self._output_enabled = list()
-        for i in range(self._output_count):
-            self._output_enabled.append(False)
+    #def _init_outputs(self):
+    #    try:
+    #        super(rigolDG1022, self)._init_outputs()
+    #    except AttributeError:
+    #        pass
+    #    
+    #    self._output_enabled = list()
+
+    #    for i in range(self._output_count):
+    #        self._output_enabled.append(False)
          
          
     def  _load_catalog(self):
@@ -372,230 +399,6 @@ class rigolDG1022(ivi.Driver, fgen.Base, fgen.StdFunc, fgen.ArbWfm,
             self._catalog = [l[i:i+3] for i in range(0, len(l), 3)]
             self._catalog_names = [l[0] for l in self._catalog]
     
-    def _get_output_operation_mode(self, index):
-        index = ivi.get_index(self._output_name, index)
-        return self._output_operation_mode[index]
-    
-    def _set_output_operation_mode(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        if value not in OperationMode:
-            raise ivi.ValueNotSupportedException()
-        self._output_operation_mode[index] = value
-    
-    def _get_output_enabled(self, index):
-
-
-
-        index = ivi.get_index(self._output_name, index)
-        if not self._driver_operation_simulate and not self._get_cache_valid(index=index):
-            resp = self._ask(":output:ch%d:state?" % (index+1)).split(' ', 1)[1]
-            self._output_standard_waveform_amplitude[index] = bool(int(resp))
-            self._set_cache_valid(index=index)
-        return self._output_enabled[index]
-    
-    def _set_output_enabled(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        value = bool(value)
-        if not self._driver_operation_simulate:
-            self._write(":output:ch%d:state %d" % (index+1, value))
-        self._output_enabled[index] = value
-        self._set_cache_valid(index=index)
-    
-    def _get_output_impedance(self, index):
-        index = ivi.get_index(self._output_name, index)
-        self._output_impedance[index] = 50
-        return self._output_impedance[index]
-    
-    def _set_output_impedance(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        value = 50
-        self._output_impedance[index] = value
-    
-    def _get_output_mode(self, index):
-        index = ivi.get_index(self._output_name, index)
-        if not self._driver_operation_simulate and not self._get_cache_valid(index=index):
-            resp = self._ask(":fg:state?").split(' ', 1)[1]
-            if int(resp):
-                self._output_mode[index] = 'function'
-            else:
-                self._output_mode[index] = 'arbitrary'
-            self._set_cache_valid(index=index)
-        return self._output_mode[index]
-    
-    def _set_output_mode(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        if value not in fgen.OutputMode:
-            raise ivi.ValueNotSupportedException()
-        if not self._driver_operation_simulate:
-            if value == 'function':
-                self._write(":fg:state 1")
-            elif value == 'arbitrary':
-                self._write(":fg:state 0")
-        self._output_mode[index] = value
-        for k in range(self._output_count):
-            self._set_cache_valid(valid=False,index=k)
-        self._set_cache_valid(index=index)
-    
-    #def _get_output_reference_clock_source(self, index):
-    #    return self._get_output_standard_waveform_property(index, "_output_standard_waveform_amplitude", "VOLT?", lambda x : float(x))
-    
-    def _set_output_reference_clock_source(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        if value not in fgen.SampleClockSource:
-            raise ivi.ValueNotSupportedException()
-        if not self._driver_operation_simulate:
-            self._write(":clock:source %s" % value)
-        self._output_reference_clock_source[index] = value
-        for k in range(self._output_count):
-            self._set_cache_valid(valid=False,index=k)
-        self._set_cache_valid(index=index)
-    
-    def abort_generation(self):
-        pass
-    
-    def initiate_generation(self):
-        pass
-    
-    #def _get_output_standard_waveform_amplitude(self, index):
-    #    return self._get_output_standard_waveform_property(index, "_output_standard_waveform_amplitude", "VOLT?", lambda x : float(x))
-    #
-    #def _set_output_standard_waveform_amplitude(self, index, value):
-    #    index = ivi.get_index(self._output_name, index)
-    #    value = float(value)
-    #    if not self._driver_operation_simulate:
-    #        self._write(":fg:ch%d:amplitude %e" % (index+1, value))
-    #    self._output_standard_waveform_amplitude[index] = value
-    #    self._set_cache_valid(index=index)
-    
-    def _get_output_standard_waveform_dc_offset(self, index):
-        return self._get_output_standard_waveform_property(index, "_output_standard_waveform_dc_offset", "VOLT:OFF?", lambda x : float(x))
-    
-    def _set_output_standard_waveform_dc_offset(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        value = float(value)
-        if not self._driver_operation_simulate:
-            self._write(":fg:ch%d:offset %e" % (index+1, value))
-        self._output_standard_waveform_dc_offset[index] = value
-        self._set_cache_valid(index=index)
-    
-    def _get_output_standard_waveform_duty_cycle_high(self, index):
-        self._get_output_standard_waveform_property(index, "_output_standard_waveform_duty_cycle_high", "FUNC:SQU:DCYC?", lambda x : float(x))
-    
-    def _set_output_standard_waveform_duty_cycle_high(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        value = float(value)
-        self._output_standard_waveform_duty_cycle_high[index] = value
-    
-    def _get_output_standard_waveform_start_phase(self, index):
-        self._get_output_standard_waveform_property(index, "_output_standard_waveform_start_phase", "PHAS?", lambda x : float(x))
-    
-    def _set_output_standard_waveform_start_phase(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        value = float(value)
-        self._output_standard_waveform_start_phase[index] = value
-
-
-    def _get_output_standard_waveform_property(self, index, prop, command, response_parser = lambda x : x):
-        """ Retrieves the given property using the command given, updating the cache if necessary. """
-
-        #Determine the relevant array index for channel index given.
-        index = ivi.get_index(self._output_name, index)
-
-        #If we're not simulating the device, and nothing has changed, run the relevant command.
-        if not self._driver_operation_simulate and not self._get_cache_valid(index=index):
-
-            #Adjust the command to contain the channel number, if necessary.
-            command = self._get_command_modified_for_channel(command, index)
-
-            #Perform the raw query...
-            response = self._ask(command)
-           
-            #... and update the cache.
-            getattr(self, prop)[index] = response_parser(response)
-            self._set_cache_valid(index=index)
-
-        #Return the relevant cached property.
-        return getattr(self, prop)[index]
-
-
-    def _get_command_modified_for_channel(self, command, index):
-        """ Modifies the given command to take place on the provided channel index, in Rigol format. """
-
-        #If this is the first channel
-        if index <= 0:
-            return command
-
-        #Compute the channel number, which is one greater than the index.
-        channel_number = index + 1
-
-        #If this is a query, we'll need to add the channel name before the question mark...
-        if "?" in command:
-            command = command.replace("?", ":CH" + str(channel_number) + "?", 1)
-
-        #... otherwise, we can just append it.
-        else:
-            command = command + ":CH" + channel_number
-
-        #Return the modified command.
-        return command
-
-
-    def _extract_channel_data(self, channel_data):
-        """ 
-            Extracts the relevant data from a channel-prefixed result. 
-            Intended to be passed as an argument to _get_output_standard_waveform_property.
-        """
-        return channel_data(':', 1)[1]
-
-
-
-    def _get_output_standard_waveform_frequency(self, index):
-        self._get_output_standard_waveform_property(index, "_output_standard_waveform_frequency", "FREQ?", lambda x : float(x))
-
-    
-    def _set_output_standard_waveform_frequency(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        value = float(value)
-        if not self._driver_operation_simulate:
-            self._write(":fg:frequency %e" % value)
-        self._output_standard_waveform_frequency[index] = value
-        for k in range(self._output_count):
-            self._set_cache_valid(valid=False,index=k)
-        self._set_cache_valid(index=index)
-    
-    def _get_output_standard_waveform_waveform(self, index):
-        return self._get_output_standard_waveform_property(index, "_output_standard_waveform_waveform", "FUNC?", self._colon_delimited)
-    
-    def _set_output_standard_waveform_waveform(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        if value not in StandardWaveformMapping:
-            raise ivi.ValueNotSupportedException()
-        if not self._driver_operation_simulate:
-            self._write(":fg:ch%d:shape %s" % (index+1, StandardWaveformMapping[value]))
-        self._output_standard_waveform_waveform[index] = value
-        self._set_cache_valid(index=index)
-    
-    def _get_output_arbitrary_gain(self, index):
-        return self._get_output_standard_waveform_property(index, "_output_standard_waveform_gain", "VOLT?", lambda x : float(x))
-    
-    def _set_output_arbitrary_gain(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        value = float(value)
-        if not self._driver_operation_simulate:
-            self._write(":ch%d:amplitude %e" % (index+1, value))
-        self._output_arbitrary_gain[index] = value
-        self._set_cache_valid(index=index)
-    
-    def _get_output_arbitrary_offset(self, index):
-        return self._get_output_standard_waveform_property(index, "_output_standard_waveform_offset", "VOLT:OFF?", lambda x : float(x))
-    
-    def _set_output_arbitrary_offset(self, index, value):
-        index = ivi.get_index(self._output_name, index)
-        value = float(value)
-        if not self._driver_operation_simulate:
-            self._write(":ch%d:offset %e" % (index+1, value))
-        self._output_arbitrary_offset[index] = value
-        self._set_cache_valid(index=index)
     
     def _get_output_arbitrary_waveform(self, index):
 
